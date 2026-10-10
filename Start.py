@@ -465,6 +465,10 @@ def ensure_regions(nodes):
 # 六、④ Cloudflare DNS 自动解析同步与消息通知
 # ============================================================================
 
+# ============================================================================
+# 六、④ Cloudflare DNS 自动解析同步与消息通知
+# ============================================================================
+
 def sync_to_cloudflare_dns(final_nodes):
     if not CF_DNS_ENABLED or not CF_ZONE_ID or CF_ZONE_ID == "你的_Zone_ID" or not CF_API_TOKEN or CF_API_TOKEN == "你的_API_Token":
         print("⏭️  Cloudflare DNS 自动同步未开启或配置不完整，跳过。")
@@ -472,18 +476,32 @@ def sync_to_cloudflare_dns(final_nodes):
 
     print("\n☁️  ── 正在同步优选 IP 到 Cloudflare DNS ──")
     
+    # 1. 定义你需要的特定国家白名单子域名映射
+    target_regions = {'jp', 'kr', 'sg', 'us', 'ca'}
+    
     region_ips = {}
+    all_ips = []
+
     for node in final_nodes:
         base, _, region = node.rpartition('#')
         if not region:
             continue
-        region = region.lower()
+        region_lower = region.lower()
         host = base.rpartition(':')[0].strip('[]')
         
-        if region not in region_ips:
-            region_ips[region] = []
-        if host not in region_ips[region]:
-            region_ips[region].append(host)
+        # 收集所有有效 IP 用于 all 域名
+        if host not in all_ips:
+            all_ips.append(host)
+            
+        # 如果在白名单内，按国家分类
+        if region_lower in target_regions:
+            if region_lower not in region_ips:
+                region_ips[region_lower] = []
+            if host not in region_ips[region_ips[region_lower]]:
+                region_ips[region_lower].append(host)
+
+    # 把“all”也作为特殊分组加入处理
+    region_ips['all'] = all_ips
 
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
@@ -492,9 +510,15 @@ def sync_to_cloudflare_dns(final_nodes):
 
     sync_stats = {}
     for region, ips in region_ips.items():
-        subdomain = CF_DOMAIN_TEMPLATE.format(region=region)
+        # 如果是 all，使用 all.proxyip.p30.kdns.fr 模板，否则使用对应国家模板
+        if region == 'all':
+            subdomain = "all.proxyip.p30.kdns.fr"
+        else:
+            subdomain = CF_DOMAIN_TEMPLATE.format(region=region)
+            
         print(f"👉 正在处理子域名: {subdomain} (共 {len(ips)} 个 IP)...")
 
+        # 第一步：查询该子域名现有的 DNS 记录 ID
         list_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records?name={subdomain}"
         try:
             req = urllib.request.Request(list_url, headers=headers, method='GET')
@@ -505,6 +529,7 @@ def sync_to_cloudflare_dns(final_nodes):
             print(f"   ⚠️ 查询现有 DNS 记录失败 [{subdomain}]: {e}")
             continue
 
+        # 第二步：清除旧记录
         for rec in existing_records:
             rec_id = rec['id']
             del_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{rec_id}"
@@ -514,7 +539,10 @@ def sync_to_cloudflare_dns(final_nodes):
             except Exception:
                 pass
 
-        target_ips = ips[:MAX_RECORDS_PER_REGION]
+        # 第三步：写入新记录（all 域名可以适当多放几个，例如最多 50 个，指定国家保持 20 个）
+        limit_count = 50 if region == 'all' else MAX_RECORDS_PER_REGION
+        target_ips = ips[:limit_count]
+        
         success_count = 0
         for ip in target_ips:
             rec_type = "AAAA" if ":" in ip else "A"
