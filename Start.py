@@ -108,7 +108,8 @@ CF_ZONE_ID = os.environ.get("CF_ZONE_ID", "你的_Zone_ID")  # 域名 kdns.fr �
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "你的_API_Token")  # 具有 Zone.DNS (Edit) 权限的 API Token
 CF_DOMAIN_TEMPLATE = "{region}.proxyip.p30.kdns.fr"       # 子域名模板，{region} 会自动转为小写 (如 us, sg, jp)
 CF_PROXY_STATUS = False                                  # 优选 IP 解析是否开启 Cloudflare 代理小云朵 (通常选 False 直连)
-MAX_RECORDS_PER_REGION = 10                              # 指定国家白名单每个最多同步多少个 IP
+MAX_RECORDS_PER_REGION = 10                              # 每个指定国家白名单最多同步多少个 IP
+MAX_RECORDS_FOR_ALL = 20                                 # all 聚合域名最多同步多少个 IP
 
 # ===== 自建微信推送配置 =====
 WECHAT_API_URL = os.environ.get("WECHAT_API_URL", "https://wx.djcf.pp.ua/wxsend")
@@ -463,7 +464,7 @@ def sync_to_cloudflare_dns(final_nodes):
 
     print("\n☁️  ── 正在同步优选 IP 到 Cloudflare DNS ──")
     
-    # 仅允许自动解析的指定国家白名单
+    # 仅允许自动解析的指定国家白名单（包含你要求的 jp, kr, sg, us, ca）
     target_regions = {'jp', 'kr', 'sg', 'us', 'ca'}
     
     region_ips = {}
@@ -504,6 +505,7 @@ def sync_to_cloudflare_dns(final_nodes):
             
         print(f"👉 正在处理子域名: {subdomain} (共 {len(ips)} 个 IP)...")
 
+        # 第一步：查询该子域名现有的 DNS 记录
         list_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records?name={subdomain}"
         try:
             req = urllib.request.Request(list_url, headers=headers, method='GET')
@@ -514,6 +516,7 @@ def sync_to_cloudflare_dns(final_nodes):
             print(f"   ⚠️ 查询现有 DNS 记录失败 [{subdomain}]: {e}")
             continue
 
+        # 第二步：清除旧记录，准备更新
         for rec in existing_records:
             rec_id = rec['id']
             del_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{rec_id}"
@@ -523,8 +526,8 @@ def sync_to_cloudflare_dns(final_nodes):
             except Exception:
                 pass
 
-        # all 域名最多写入 50 个 IP，白名单国家最多写入设定的数量
-        limit_count = 50 if region == 'all' else MAX_RECORDS_PER_REGION
+        # 第三步：写入新记录（白名单国家最多写入设定数量，all 最多 20 个）
+        limit_count = MAX_RECORDS_FOR_ALL if region == 'all' else MAX_RECORDS_PER_REGION
         target_ips = ips[:limit_count]
         
         success_count = 0
