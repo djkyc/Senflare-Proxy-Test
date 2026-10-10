@@ -108,7 +108,7 @@ CF_ZONE_ID = os.environ.get("CF_ZONE_ID", "你的_Zone_ID")  # 域名 kdns.fr �
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "你的_API_Token")  # 具有 Zone.DNS (Edit) 权限的 API Token
 CF_DOMAIN_TEMPLATE = "{region}.proxyip.p30.kdns.fr"       # 子域名模板，{region} 会自动转为小写 (如 us, sg, jp)
 CF_PROXY_STATUS = False                                  # 优选 IP 解析是否开启 Cloudflare 代理小云朵 (通常选 False 直连)
-MAX_RECORDS_PER_REGION = 10                              # 每个指定国家白名单最多同步多少个 IP
+MAX_RECORDS_PER_REGION = 5                              # 每个指定国家白名单最多同步多少个 IP
 MAX_RECORDS_FOR_ALL = 20                                 # all 聚合域名最多同步多少个 IP
 
 # ===== 自建微信推送配置 =====
