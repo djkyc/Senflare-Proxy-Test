@@ -108,7 +108,7 @@ CF_ZONE_ID = os.environ.get("CF_ZONE_ID", "你的_Zone_ID")  # 域名 kdns.fr �
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "你的_API_Token")  # 具有 Zone.DNS (Edit) 权限的 API Token
 CF_DOMAIN_TEMPLATE = "{region}.proxyip.p30.kdns.fr"       # 子域名模板，{region} 会自动转为小写 (如 us, sg, jp)
 CF_PROXY_STATUS = False                                  # 优选 IP 解析是否开启 Cloudflare 代理小云朵 (通常选 False 直连)
-MAX_RECORDS_PER_REGION = 5                              # 每个指定国家白名单最多同步多少个 IP
+MAX_RECORDS_PER_REGION = 5                               # 每个指定国家白名单最多同步多少个 IP
 MAX_RECORDS_FOR_ALL = 20                                 # all 聚合域名最多同步多少个 IP
 
 # ===== 自建微信推送配置 =====
@@ -464,7 +464,6 @@ def sync_to_cloudflare_dns(final_nodes):
 
     print("\n☁️  ── 正在同步优选 IP 到 Cloudflare DNS ──")
     
-    # 仅允许自动解析的指定国家白名单（包含你要求的 jp, kr, sg, us, ca）
     target_regions = {'jp', 'kr', 'sg', 'us', 'ca'}
     
     region_ips = {}
@@ -477,18 +476,15 @@ def sync_to_cloudflare_dns(final_nodes):
         region_lower = region.lower()
         host = base.rpartition(':')[0].strip('[]')
         
-        # 收集所有有效节点 IP 用于 all.proxyip.p30.kdns.fr
         if host not in all_ips:
             all_ips.append(host)
             
-        # 匹配白名单国家
         if region_lower in target_regions:
             if region_lower not in region_ips:
                 region_ips[region_lower] = []
             if host not in region_ips[region_lower]:
                 region_ips[region_lower].append(host)
 
-    # 将 all 聚合分组加入
     region_ips['all'] = all_ips
 
     headers = {
@@ -505,7 +501,6 @@ def sync_to_cloudflare_dns(final_nodes):
             
         print(f"👉 正在处理子域名: {subdomain} (共 {len(ips)} 个 IP)...")
 
-        # 第一步：查询该子域名现有的 DNS 记录
         list_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records?name={subdomain}"
         try:
             req = urllib.request.Request(list_url, headers=headers, method='GET')
@@ -516,7 +511,6 @@ def sync_to_cloudflare_dns(final_nodes):
             print(f"   ⚠️ 查询现有 DNS 记录失败 [{subdomain}]: {e}")
             continue
 
-        # 第二步：清除旧记录，准备更新
         for rec in existing_records:
             rec_id = rec['id']
             del_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{rec_id}"
@@ -526,7 +520,6 @@ def sync_to_cloudflare_dns(final_nodes):
             except Exception:
                 pass
 
-        # 第三步：写入新记录（白名单国家最多写入设定数量，all 最多 20 个）
         limit_count = MAX_RECORDS_FOR_ALL if region == 'all' else MAX_RECORDS_PER_REGION
         target_ips = ips[:limit_count]
         
@@ -561,20 +554,28 @@ def send_wechat_notification(msg):
     if not WECHAT_API_URL:
         return
     try:
-        try:
-            body_dict = json.loads(WECHAT_BODY_TEMPLATE)
-            body_dict['content'] = msg
-            data_bytes = json.dumps(body_dict, ensure_ascii=False).encode('utf-8')
-        except Exception:
-            safe_msg = msg.replace('"', '\\"').replace('\n', '\\n')
-            data_bytes = WECHAT_BODY_TEMPLATE.replace('$MSG', safe_msg).encode('utf-8')
-        
-        headers = {'Content-Type': 'application/json'}
+        # 1. 将 Token 拼接到 URL 中（与成功测试的 curl 保持一致）
+        api_url = WECHAT_API_URL
         if WECHAT_AUTH_TOKEN:
-            headers['Authorization'] = f'Bearer {WECHAT_AUTH_TOKEN}'
-            headers['token'] = WECHAT_AUTH_TOKEN
+            delimiter = '&' if '?' in api_url else '?'
+            api_url = f"{api_url}{delimiter}token={WECHAT_AUTH_TOKEN}"
+
+        # 2. 组装标准的 JSON 请求体
+        body_dict = {
+            "title": "Proxyip 优选",
+            "content": msg
+        }
+        data_bytes = json.dumps(body_dict, ensure_ascii=False).encode('utf-8')
         
-        req = urllib.request.Request(WECHAT_API_URL, data=data_bytes, headers=headers, method='POST')
+        # 3. 模拟完整的标准请求头
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Encoding': 'gzip, deflate'
+        }
+        
+        req = urllib.request.Request(api_url, data=data_bytes, headers=headers, method='POST')
         with urllib.request.urlopen(req, timeout=10):
             print("📱 微信通知发送成功")
     except Exception as e:
@@ -670,7 +671,7 @@ def main():
 
     # 组装通知消息
     notif_msg = (
-        f"🌐 *Proxy IP 优选完成*\n\n"
+        f"🌐 *Proxy Ip 优选完成*\n\n"
         f"📊 *统计数据*：\n"
         f"• 免测直入：`{len(direct_nodes)}` 个\n"
         f"• 测试通过：`{len(passed)}` 个\n"
