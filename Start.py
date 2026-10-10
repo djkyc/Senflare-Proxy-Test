@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Senflare Proxy Test —— Cloudflare ProxyIP 聚合 / 测试脚本 —— 多源汇聚
+Senflare Proxy Test —— Cloudflare ProxyIP 聚合 / 测试脚本 —— 多源汇聚 + DNS自动同步 + 消息通知
 
 流程：拉取多源（纯 IP 也收）→ 组内去重 → 免测源直入 + 其余源走 ① TCP 存活测试 → ② HTTP 真CF验证
      → ③ 地区补全（缓存优先，纯 IP 节点统一格式）→ 合并去重输出 Senflare-Proxy.txt
+     → ④ 自动同步解析到 Cloudflare DNS 子域名 → ⑤ 发送微信/TG 运行报告
 
-数据源按「只拉取 / 需测试」分成两组配置。
 仅用 Python 标准库，无需安装任何依赖。Python 3.8+。
 """
 
@@ -43,7 +43,7 @@ DIRECT_SOURCES = {
     #   - ChatBotPlus：https://github.com/ChatBotPlus/cf-proxyips （list.txt）
     #   - Ymyuuu：https://github.com/ymyuuu/IPDB （BestProxy 的 proxy.txt 与 bestproxy&country.txt）
     #   - Mountain787：https://github.com/mountain787/Lunch-Bag-ip （proxyip.csv）
-    # 拉取走 jsDelivr CDN 加速；原始地址：https://raw.githubusercontent.com/Xiaobei09/proxyip/refs/heads/main/data/valid/all.txt
+    # 拉取走 jsDelivr CDN 加速；原始地址：https://raw.githubusercontent.com/Xiaobei09/proxyip/refs/heads/main/data/valid/all.txt 脚本是放在github工作流中运行的
     'Xiaobei': {
         'url': 'https://cdn.jsdelivr.net/gh/Xiaobei09/proxyip@main/data/valid/all.txt',
     },
@@ -99,6 +99,26 @@ REGION_TIMEOUT = 5         # 单次查询超时（秒）
 OUTPUT_FILE = os.path.join(_SCRIPT_DIR, 'Senflare-Proxy.txt')
 PROGRESS_INTERVAL = 1     # 进度打印刷新间隔（秒）
 TEST_LIMIT = 0            # 🧪 试跑模式：每组只取前 N 个节点走完整流程（0 = 全量）
+
+# ============================================================================
+# 七、Cloudflare DNS 自动解析与消息通知配置
+# ============================================================================
+CF_DNS_ENABLED = False                    # 是否开启自动同步到 Cloudflare DNS（在 GitHub Actions 中运行时建议设为 True 并配置下方密匙）
+CF_ZONE_ID = "你的_Zone_ID"                # 域名 kdns.fr 的 Cloudflare Zone ID
+CF_API_TOKEN = "你的_API_Token"            # 具有 Zone.DNS (Edit) 权限的 API Token
+CF_DOMAIN_TEMPLATE = "{region}.proxyip.p30.kdns.fr"  # 子域名模板，{region} 会自动转为小写 (如 us, sg, jp)
+CF_PROXY_STATUS = False                   # 优选 IP 解析是否开启 Cloudflare 代理小云朵 (通常选 False 直连)
+MAX_RECORDS_PER_REGION = 20               # 每个地区最多自动同步多少个 IP 到子域名（避免DNS过长）
+
+# ===== 自建微信推送配置（可选）=====
+WECHAT_API_URL = "https://wx.djcf.pp.ua/wxsend"
+WECHAT_AUTH_TOKEN = "sb123"
+WECHAT_BODY_TEMPLATE = '{"title":"Cloudflare IP 双栈优选","content":"$MSG"}'
+
+# ===== Telegram 推送配置（必填：替换成你的 TG 信息）=====
+TG_BOT_TOKEN = "7764238150:AAFNlC_U4kHQVaF3zil3mlT7s5ALAn9Y4Fg"  # 你的机器人Token
+TG_CHAT_ID = "7646414260"                                      # 你的聊天ID/频道ID
+TG_API_URL = "https://api.telegram.org/bot"                   # TG API地址（无需修改）
 
 
 # ============================================================================
@@ -298,7 +318,6 @@ def check_http(node):
     rounds = max(3, HTTP_JITTER_SAMPLES)
     latencies = []
     for _ in range(rounds):
-        # HTTPConnection 不支持 with 语法，用 try/finally 确保连接必关
         conn = http.client.HTTPConnection(host.strip('[]'), int(port), timeout=HTTP_TEST_TIMEOUT)
         try:
             start = time.time()
@@ -386,9 +405,9 @@ def query_ipinfo(ip):
             code = data.get('country_code') or data.get('country') or ''
             return code.upper() if isinstance(code, str) and len(code) == 2 else None
         except urllib.error.HTTPError:
-            return None              # 状态码异常（限流/拒绝），重试无意义
+            return None
         except Exception:
-            continue                 # 网络抖动：再试一次
+            continue
     return None
 
 
@@ -434,7 +453,7 @@ def ensure_regions(nodes):
             continue
         host = base.rpartition(':')[0]
         code = cache.get(host)
-        if code:                       # 缓存命中：刷新 LRU 位置并直接填充
+        if code:
             cache.move_to_end(host)
             hits += 1
             result[i] = f'{base}#{code}'
@@ -463,10 +482,10 @@ def ensure_regions(nodes):
                     base = result[i].rpartition('#')[0]
                     host = base.rpartition(':')[0]
                     result[i] = f'{base}#{code}'
-                    cache[host] = code  # 重新插入即刷新 LRU 位置
+                    cache[host] = code
                 else:
                     failed += 1
-                    result[i] = None    # 补不到地区的剔除
+                    result[i] = None
                 now = time.time()
                 if now - last_print >= PROGRESS_INTERVAL or done == total:
                     print(f'\r⏳ 地区查询 进度 {fmt(done)}/{fmt(total)} · 成功 {fmt(queried_ok)}   ',
@@ -482,7 +501,139 @@ def ensure_regions(nodes):
 
 
 # ============================================================================
-# 六、输出
+# 六、④ Cloudflare DNS 自动解析同步与消息通知
+# ============================================================================
+
+def sync_to_cloudflare_dns(final_nodes):
+    """
+    按国家/地区对节点分组，动态自动同步解析到对应子域名
+    """
+    if not CF_DNS_ENABLED or not CF_ZONE_ID or not CF_API_TOKEN:
+        print("⏭️  Cloudflare DNS 自动同步未开启或配置不完整，跳过。")
+        return {}
+
+    print("\n☁️  ── 正在同步优选 IP 到 Cloudflare DNS ──")
+    
+    region_ips = {}
+    for node in final_nodes:
+        base, _, region = node.rpartition('#')
+        if not region:
+            continue
+        region = region.lower()
+        host = base.rpartition(':')[0].strip('[]')
+        
+        if region not in region_ips:
+            region_ips[region] = []
+        if host not in region_ips[region]:
+            region_ips[region].append(host)
+
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    sync_stats = {}
+    for region, ips in region_ips.items():
+        subdomain = CF_DOMAIN_TEMPLATE.format(region=region)
+        print(f"👉 正在处理子域名: {subdomain} (共 {len(ips)} 个 IP)...")
+
+        list_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records?name={subdomain}"
+        try:
+            req = urllib.request.Request(list_url, headers=headers, method='GET')
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+                existing_records = result.get('result', [])
+        except Exception as e:
+            print(f"   ⚠️ 查询现有 DNS 记录失败 [{subdomain}]: {e}")
+            continue
+
+        for rec in existing_records:
+            rec_id = rec['id']
+            del_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{rec_id}"
+            try:
+                del_req = urllib.request.Request(del_url, headers=headers, method='DELETE')
+                urllib.request.urlopen(del_req, timeout=10)
+            except Exception:
+                pass
+
+        target_ips = ips[:MAX_RECORDS_PER_REGION]
+        success_count = 0
+        for ip in target_ips:
+            rec_type = "AAAA" if ":" in ip else "A"
+            payload = {
+                "type": rec_type,
+                "name": subdomain,
+                "content": ip,
+                "proxied": CF_PROXY_STATUS,
+                "comment": "Senflare Auto ProxyIP"
+            }
+            create_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
+            try:
+                data_bytes = json.dumps(payload).encode('utf-8')
+                create_req = urllib.request.Request(create_url, data=data_bytes, headers=headers, method='POST')
+                with urllib.request.urlopen(create_req, timeout=10) as resp:
+                    res_json = json.loads(resp.read().decode('utf-8'))
+                    if res_json.get('success'):
+                        success_count += 1
+            except Exception:
+                pass
+
+        sync_stats[subdomain] = success_count
+        print(f"   ✅ {subdomain} 同步完成：成功写入 {success_count}/{len(target_ips)} 个节点 IP")
+    
+    return sync_stats
+
+
+def send_wechat_notification(msg):
+    if not WECHAT_API_URL:
+        return
+    try:
+        try:
+            body_dict = json.loads(WECHAT_BODY_TEMPLATE)
+            body_dict['content'] = msg
+            data_bytes = json.dumps(body_dict, ensure_ascii=False).encode('utf-8')
+        except Exception:
+            safe_msg = msg.replace('"', '\\"').replace('\n', '\\n')
+            data_bytes = WECHAT_BODY_TEMPLATE.replace('$MSG', safe_msg).encode('utf-8')
+        
+        headers = {'Content-Type': 'application/json'}
+        if WECHAT_AUTH_TOKEN:
+            headers['Authorization'] = f'Bearer {WECHAT_AUTH_TOKEN}'
+            headers['token'] = WECHAT_AUTH_TOKEN
+        
+        req = urllib.request.Request(WECHAT_API_URL, data=data_bytes, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print("📱 微信通知发送成功")
+    except Exception as e:
+        print(f"⚠️ 微信通知发送失败: {e}")
+
+
+def send_telegram_notification(msg):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        url = f"{TG_API_URL}{TG_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': TG_CHAT_ID,
+            'text': msg,
+            'parse_mode': 'Markdown'
+        }
+        data_bytes = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        headers = {'Content-Type': 'application/json'}
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print("✈️ Telegram 通知发送成功")
+    except Exception as e:
+        print(f"⚠️ Telegram 通知发送失败: {e}")
+
+
+def send_notifications(summary_text):
+    send_wechat_notification(summary_text)
+    send_telegram_notification(summary_text)
+
+
+# ============================================================================
+# 七、主程序
 # ============================================================================
 
 def main():
@@ -493,12 +644,10 @@ def main():
 
     direct_nodes, test_nodes = load_nodes()
 
-    # 试跑模式：拉全量源后截断，只对前 N 个走 测试 → 补全 → 输出
     if TEST_LIMIT > 0:
         direct_nodes = direct_nodes[:TEST_LIMIT]
         test_nodes = test_nodes[:TEST_LIMIT]
 
-    # 待测源走 ①TCP → ②HTTP 两层；只拉取组跳过
     passed = []
     if test_nodes:
         alive = run_tcp_tests(test_nodes)
@@ -507,7 +656,6 @@ def main():
         else:
             passed = run_http_tests(alive)
 
-    # ③ 地区补全：无地区码（纯 IP）的节点查接口补齐，缓存优先，补不上的剔除
     direct_nodes = ensure_regions(direct_nodes)
     if passed:
         meta = {t[0]: t[1:] for t in passed}
@@ -518,8 +666,6 @@ def main():
         print('❌ 没有任何有效节点，退出')
         sys.exit(1)
 
-    # 结果合并：免测聚合数据在前，测试通过的按 HTTP 延迟升序在后；
-    # 两组合流后再做一次去重兜底（按 ip:port，保留先出现者）
     passed.sort(key=lambda x: x[2] if x[2] > 0 else float('inf'))
     final_seen = set()
     final_nodes = []
@@ -542,7 +688,32 @@ def main():
 
     print(f'\n💾 已写入 {OUTPUT_FILE}：只拉取 {fmt(len(direct_nodes))} + '
           f'测试通过 {fmt(len(passed))} = 合并 {fmt(len(final_nodes))} 个')
-    print(f'\n🎉 全部完成 · 耗时 {time.time() - started:.0f} 秒')
+
+    # 自动同步 DNS
+    sync_stats = sync_to_cloudflare_dns(final_nodes)
+
+    elapsed = time.time() - started
+
+    # 组装通知消息
+    notif_msg = (
+        f"🌐 *Cloudflare IP 双栈优选完成*\n\n"
+        f"📊 *统计数据*：\n"
+        f"• 免测直入：`{len(direct_nodes)}` 个\n"
+        f"• 测试通过：`{len(passed)}` 个\n"
+        f"• 最终合并：`{len(final_nodes)}` 个\n"
+        f"⏱️ *总耗时*：`{elapsed:.0f}` 秒\n"
+    )
+    if sync_stats:
+        notif_msg += f"\n☁️ *DNS 子域名解析同步*：\n"
+        for sub, count in sync_stats.items():
+            notif_msg += f"• `{sub}`: 写入 `{count}` 个IP\n"
+    else:
+        notif_msg += f"\n☁️ *DNS 同步*：未开启或未执行\n"
+
+    # 发送双渠道通知
+    send_notifications(notif_msg)
+
+    print(f'\n🎉 全部完成 · 耗时 {elapsed:.0f} 秒')
 
 
 if __name__ == '__main__':
