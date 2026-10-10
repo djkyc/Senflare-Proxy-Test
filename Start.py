@@ -101,24 +101,24 @@ PROGRESS_INTERVAL = 1     # 进度打印刷新间隔（秒）
 TEST_LIMIT = 0            # 🧪 试跑模式：每组只取前 N 个节点走完整流程（0 = 全量）
 
 # ============================================================================
-# 七、Cloudflare DNS 自动解析与消息通知配置
+# 七、Cloudflare DNS 自动解析与消息通知配置（优先读取环境变量，安全防泄漏）
 # ============================================================================
-CF_DNS_ENABLED = False                    # 是否开启自动同步到 Cloudflare DNS（在 GitHub Actions 中运行时建议设为 True 并配置下方密匙）
-CF_ZONE_ID = "你的_Zone_ID"                # 域名 kdns.fr 的 Cloudflare Zone ID
-CF_API_TOKEN = "你的_API_Token"            # 具有 Zone.DNS (Edit) 权限的 API Token
-CF_DOMAIN_TEMPLATE = "{region}.proxyip.p30.kdns.fr"  # 子域名模板，{region} 会自动转为小写 (如 us, sg, jp)
-CF_PROXY_STATUS = False                   # 优选 IP 解析是否开启 Cloudflare 代理小云朵 (通常选 False 直连)
-MAX_RECORDS_PER_REGION = 20               # 每个地区最多自动同步多少个 IP 到子域名（避免DNS过长）
+CF_DNS_ENABLED = True                                    # 是否开启自动同步到 Cloudflare DNS
+CF_ZONE_ID = os.environ.get("CF_ZONE_ID", "你的_Zone_ID")  # 域名 kdns.fr 的 Cloudflare Zone ID
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "你的_API_Token")  # 具有 Zone.DNS (Edit) 权限的 API Token
+CF_DOMAIN_TEMPLATE = "{region}.proxyip.p30.kdns.fr"       # 子域名模板，{region} 会自动转为小写 (如 us, sg, jp)
+CF_PROXY_STATUS = False                                  # 优选 IP 解析是否开启 Cloudflare 代理小云朵 (通常选 False 直连)
+MAX_RECORDS_PER_REGION = 10                              # 每个地区最多自动同步多少个 IP 到子域名（避免DNS过长）
 
-# ===== 自建微信推送配置（可选）=====
-WECHAT_API_URL = "https://wx.djcf.pp.ua/wxsend"
-WECHAT_AUTH_TOKEN = "sb123"
-WECHAT_BODY_TEMPLATE = '{"title":"Cloudflare IP 双栈优选","content":"$MSG"}'
+# ===== 自建微信推送配置 =====
+WECHAT_API_URL = os.environ.get("WECHAT_API_URL", "https://wx.djcf.pp.ua/wxsend")
+WECHAT_AUTH_TOKEN = os.environ.get("WECHAT_AUTH_TOKEN", "123")
+WECHAT_BODY_TEMPLATE = os.environ.get("WECHAT_BODY_TEMPLATE", '{"title":"Proxyip 优选","content":"$MSG"}')
 
-# ===== Telegram 推送配置（必填：替换成你的 TG 信息）=====
-TG_BOT_TOKEN = "7764238150:AAFNlC_U4kHQVaF3zil3mlT7s5ALAn9Y4Fg"  # 你的机器人Token
-TG_CHAT_ID = "7646414260"                                      # 你的聊天ID/频道ID
-TG_API_URL = "https://api.telegram.org/bot"                   # TG API地址（无需修改）
+# ===== Telegram 推送配置 =====
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "你的机器人Token")  # 优先从环境变量读取
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "你的聊天ID/频道ID")      # 优先从环境变量读取
+TG_API_URL = "https://api.telegram.org/bot"                      # TG API地址（无需修改）
 
 
 # ============================================================================
@@ -149,12 +149,6 @@ def fetch_text(url, timeout=FETCH_TIMEOUT):
 def normalize_line(line):
     """
     归一化为 ip:port#Region，主机非法返回 None。
-    兼容格式：
-      干净标签：1.2.3.4:443#US
-      富标签（Xiaobei09 实测格式）：1.2.3.4:443#🇺🇸US-10ms-CF-84-DC-RES-CN-CF-82
-      纯 IP 无端口：1.2.3.4#US → 端口默认 DEFAULT_PORT(443)
-      纯 IP / 纯 IP:端口（无地区码）→ 保留为 ip:port#，由 ③ 地区补全填充
-    有标签时取第一个大写字母段作地区码（国旗后紧跟的 ISO 码）。
     """
     line = line.strip().lstrip(chr(65279))  # 65279 = U+FEFF（BOM）
     if not line:
@@ -166,7 +160,6 @@ def normalize_line(line):
         region = m.group(0) if m else ''
     else:
         ip_port, region = line, ''
-    # 兼容三种形态：ip:port、[IPv6]:port、纯 IP（端口取 DEFAULT_PORT）
     if ':' in ip_port:
         host, _, port = ip_port.rpartition(':')
         if not host or not port.isdigit():
@@ -180,8 +173,7 @@ def normalize_line(line):
 
 def parse_columns(text, ip_idx, port_idx, country_idx, skip_header):
     """
-    通用 CSV 列位解析 → ip:port#Region（与主项目 _worker.js 的 parseColumns 一致）。
-    columns 元组：(IP列, 端口列, 地区码列, 是否跳表头)。
+    通用 CSV 列位解析 → ip:port#Region
     """
     out = []
     for raw in text.splitlines():
@@ -201,15 +193,13 @@ def parse_columns(text, ip_idx, port_idx, country_idx, skip_header):
         if re.fullmatch(r'[A-Z]{2,3}', country):
             out.append(f'{ip}:{port}#{country}')
         else:
-            out.append(f'{ip}:{port}#')  # 地区列非标准代码，留给 ③ 补全
+            out.append(f'{ip}:{port}#')
     return out
 
 
 def load_nodes():
     """
-    拉取两组源 → 归一化 → 各组内按 ip:port 独立去重（保留先出现者）。
-    两组数据来源不同、各自去重，跨组重复留给最终合并时统一清理。
-    返回 (direct_nodes, test_nodes)
+    拉取两组源 → 归一化 → 各组内按 ip:port 独立去重
     """
     def fetch_group(sources):
         seen = set()
@@ -229,7 +219,6 @@ def load_nodes():
                 continue
 
             count = 0
-            # 带 'columns' 的源按 CSV 列位解析，其余按行格式归一化
             if 'columns' in source:
                 parsed = parse_columns(text, *source['columns'])
             else:
@@ -255,13 +244,11 @@ def load_nodes():
 # ============================================================================
 
 def test_tcp(host, port):
-    """socket 直连测活：返回 (是否通过, 最小延迟ms)，失败延迟为 inf"""
     min_lat = float('inf')
     success = 0
     for _ in range(TCP_PROBES):
         try:
             start = time.time()
-            # create_connection 自动解析 IPv4/IPv6
             with socket.create_connection((host.strip('[]'), int(port)), timeout=TIMEOUT):
                 pass
             min_lat = min(min_lat, (time.time() - start) * 1000)
@@ -273,7 +260,6 @@ def test_tcp(host, port):
 
 
 def run_tcp_tests(nodes):
-    """全量 TCP 测试，返回通过的 [(node, tcp_latency_ms)]"""
     results = []
     total = len(nodes)
     done, last_print = 0, time.time()
@@ -309,11 +295,6 @@ UA_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 
 
 def check_http(node):
-    """
-    向 http://ip:port/cdn-cgi/trace 发请求，判定是否真 Cloudflare 边缘：
-      状态码必须为 400 且响应头 server 以 cloudflare 开头。
-    返回 (node, 是否通过, 平均延迟ms, 抖动ms)
-    """
     host, _, port = node.rpartition('#')[0].rpartition(':')
     rounds = max(3, HTTP_JITTER_SAMPLES)
     latencies = []
@@ -341,7 +322,6 @@ def check_http(node):
 
 
 def run_http_tests(candidates):
-    """对 TCP 存活节点做 HTTP 验证，返回 [(node, tcp_ms, http_ms, jitter_ms)]"""
     if not HTTP_TEST_ENABLED or not candidates:
         return [(n, l, 0.0, 0.0) for n, l in candidates]
 
@@ -369,25 +349,21 @@ def run_http_tests(candidates):
 
 
 # ============================================================================
-# 五、③ 地区补全（缓存优先 → 接口查询，纯 IP 节点在这里统一格式）
+# 五、③ 地区补全（缓存优先 → 接口查询）
 # ============================================================================
 
 def load_region_cache():
-    """读取本地地区缓存（ip → 国家代码），文件缺失或损坏时返回空缓存"""
     try:
         with open(REGION_CACHE_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, dict):
             return OrderedDict((str(k), str(v)) for k, v in data.items())
-    except FileNotFoundError:
+    except Exception:
         pass
-    except Exception as e:
-        print(f'⚠️  地区缓存读取失败，按空缓存处理：{e}')
     return OrderedDict()
 
 
 def save_region_cache(cache):
-    """写回地区缓存，超出上限时淘汰最久未用的条目"""
     while len(cache) > REGION_CACHE_MAX:
         cache.popitem(last=False)
     with open(REGION_CACHE_FILE, 'w', encoding='utf-8') as f:
@@ -395,7 +371,6 @@ def save_region_cache(cache):
 
 
 def query_ipinfo(ip):
-    """主查询：ipinfo.io lite 免费接口 → ISO 两位国家码"""
     url = REGION_API.format(ip=ip)
     for _ in range(2):
         try:
@@ -404,19 +379,15 @@ def query_ipinfo(ip):
                 data = json.loads(resp.read().decode('utf-8', 'ignore'))
             code = data.get('country_code') or data.get('country') or ''
             return code.upper() if isinstance(code, str) and len(code) == 2 else None
-        except urllib.error.HTTPError:
-            return None
         except Exception:
             continue
     return None
 
 
 def query_fallback(host, port):
-    """兜底：Cmliu 代理可用性检测接口 """
     try:
         qs = urlencode({'proxyip': f'{host}:{port}'})
-        req = urllib.request.Request(f'{FALLBACK_CHECK_API}?{qs}',
-                                     headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(f'{FALLBACK_CHECK_API}?{qs}', headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=REGION_TIMEOUT) as resp:
             data = json.loads(resp.read().decode('utf-8', 'ignore'))
         probes = data.get('probe_results', {})
@@ -430,7 +401,6 @@ def query_fallback(host, port):
 
 
 def query_region_api(host, port):
-    """③ 查询入口"""
     code = query_ipinfo(host)
     if code:
         return code
@@ -438,11 +408,6 @@ def query_region_api(host, port):
 
 
 def ensure_regions(nodes):
-    """
-    ③ 地区补全：本身带地区码的节点直接跳过；缺地区的优先查缓存，
-    未命中的并发调查询接口；最终拿不到地区的节点剔除（保证输出格式统一）。
-    返回补全后的节点列表（保持原顺序）。
-    """
     cache = load_region_cache()
     result = list(nodes)
     pending_idx = []
@@ -464,8 +429,7 @@ def ensure_regions(nodes):
     if pending_idx:
         total = len(pending_idx)
         done, last_print = 0, time.time()
-        print(f'\n🌍 ── ③ 地区补全 ── 待查 {fmt(total)} 个 · 缓存命中 {fmt(hits)} · '
-              f'ipinfo lite · 并发 {REGION_WORKERS}')
+        print(f'\n🌍 ── ③ 地区补全 ── 待查 {fmt(total)} 个 · 缓存命中 {fmt(hits)} · ipinfo lite · 并发 {REGION_WORKERS}')
 
         def work(i):
             base = result[i].rpartition('#')[0]
@@ -494,10 +458,7 @@ def ensure_regions(nodes):
 
     if hits or pending_idx:
         save_region_cache(cache)
-    kept = [n for n in result if n]
-    print(f'\n✅ 地区补全完成 · 缓存命中 {fmt(hits)} · 接口成功 {fmt(queried_ok)} · '
-          f'失败剔除 {fmt(failed)} · 缓存存量 {fmt(len(cache))}')
-    return kept
+    return [n for n in result if n]
 
 
 # ============================================================================
@@ -505,10 +466,7 @@ def ensure_regions(nodes):
 # ============================================================================
 
 def sync_to_cloudflare_dns(final_nodes):
-    """
-    按国家/地区对节点分组，动态自动同步解析到对应子域名
-    """
-    if not CF_DNS_ENABLED or not CF_ZONE_ID or not CF_API_TOKEN:
+    if not CF_DNS_ENABLED or not CF_ZONE_ID or CF_ZONE_ID == "你的_Zone_ID" or not CF_API_TOKEN or CF_API_TOKEN == "你的_API_Token":
         print("⏭️  Cloudflare DNS 自动同步未开启或配置不完整，跳过。")
         return {}
 
@@ -602,14 +560,15 @@ def send_wechat_notification(msg):
             headers['token'] = WECHAT_AUTH_TOKEN
         
         req = urllib.request.Request(WECHAT_API_URL, data=data_bytes, headers=headers, method='POST')
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10):
             print("📱 微信通知发送成功")
     except Exception as e:
         print(f"⚠️ 微信通知发送失败: {e}")
 
 
 def send_telegram_notification(msg):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+    if not TG_BOT_TOKEN or TG_BOT_TOKEN == "你的机器人Token" or not TG_CHAT_ID or TG_CHAT_ID == "你的聊天ID/频道ID":
+        print("⏭️ Telegram 通知未配置或使用的是默认值，跳过发送。")
         return
     try:
         url = f"{TG_API_URL}{TG_BOT_TOKEN}/sendMessage"
@@ -621,7 +580,7 @@ def send_telegram_notification(msg):
         data_bytes = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         headers = {'Content-Type': 'application/json'}
         req = urllib.request.Request(url, data=data_bytes, headers=headers, method='POST')
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10):
             print("✈️ Telegram 通知发送成功")
     except Exception as e:
         print(f"⚠️ Telegram 通知发送失败: {e}")
