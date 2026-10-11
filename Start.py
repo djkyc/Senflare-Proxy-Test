@@ -554,7 +554,10 @@ def send_wechat_notification(msg):
     if not WECHAT_API_URL:
         return
     try:
-        # 1. 将 Token 拼接到 URL 中（与成功测试的 curl 保持一致）
+        # 清洗掉 Telegram 常用的 Markdown 符号 (* 和 `)，避免在微信中显示成特殊字符或乱码
+        clean_msg = msg.replace('*', '').replace('`', '')
+
+        # 1. 将 Token 拼接到 URL 中
         api_url = WECHAT_API_URL
         if WECHAT_AUTH_TOKEN:
             delimiter = '&' if '?' in api_url else '?'
@@ -563,7 +566,7 @@ def send_wechat_notification(msg):
         # 2. 组装标准的 JSON 请求体
         body_dict = {
             "title": "Proxyip 优选",
-            "content": msg
+            "content": clean_msg
         }
         data_bytes = json.dumps(body_dict, ensure_ascii=False).encode('utf-8')
         
