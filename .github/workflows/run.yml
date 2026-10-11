@@ -40,12 +40,13 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 分开 add：任一文件本次未生成（如无节点需查地区时没有缓存文件）不影响另一个的提交
           git add Senflare-Proxy.txt || true
+          git add Senflare-Proxy-Bidirectional.txt Senflare-Proxy-Forward.txt Senflare-Proxy-Reverse.txt Senflare-Proxy-Invalid.txt Senflare-Proxy-All.txt || true
           git add Senflare-Country.json || true
           if git diff --cached --quiet; then
             echo "✅ 结果无变化，跳过提交"
           else
-            git commit -m "🔄 数据更新 $(date -u +%Y-%m-%d-%H:%M) [ Senflare ]"
+            git commit -m "🔄 数据更新 $(TZ=Asia/Shanghai date +%Y-%m-%d-%H:%M) [ Senflare ]"
+            git pull --rebase origin main2 || git pull --rebase origin main || true
             git push
           fi
